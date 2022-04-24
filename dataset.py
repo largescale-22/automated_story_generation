@@ -13,11 +13,13 @@ import time
 from multiprocessing import Pool
 
 import numpy as np
-from torch.utils.data import Dataset
+import torch
+from torch.utils.data import Dataset, TensorDataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from path.path import get_project_root
+from utils_multiple_choice import InputFeatures
 
 SPLIT_NAMES = ("train", "validation", "test")
 CLS_TOKEN = "<CLS>"
@@ -39,7 +41,7 @@ def parse_args():
 
     parser.add_argument("--data_dir", type=str, default="data/storium/")
     parser.add_argument("--cache_dir", type=str, default="caches")
-    parser.add_argument("--max_sequence_length", type=int, default=1000)
+    parser.add_argument("--max_seq_length", type=int, default=1000)
     parser.add_argument("--max_prev_story_length", type=int, default=450)
     parser.add_argument("--max_establishment_length", type=int, default=200)
     parser.add_argument("--max_char_description_length", type=int, default=320)
@@ -63,10 +65,10 @@ class DataProcessor:
     data in a format that we can use.
     """
 
-    def __init__(self, args, tokenizer: PreTrainedTokenizer, max_sequence_length: int = 800):
+    def __init__(self, args, tokenizer: PreTrainedTokenizer, max_seq_length: int = 800):
         self.args = args
         self.tokenizer = tokenizer
-        self.max_sequence_length = max_sequence_length
+        self.max_seq_length = max_seq_length
 
     def process_story_file(self, filepath: str):
 
@@ -217,12 +219,13 @@ class DataProcessor:
 
 
 class SceneDataset(Dataset):
-    def __init__(self, args, split: str, tokenizer_name: str, cache_dir: Optional[str] = None):
+    def __init__(self, args, split: str, tokenizer: str, cache_dir: Optional[str] = None):
         self.args = args
         self.split = split.lower()
         self.cache_dir = cache_dir
-        self.tokenizer_name = tokenizer_name.lower()
+        self.tokenizer = tokenizer
         self.entries: List[Dict[str, Any]] = []
+        self.tensor_features = []
 
     def __len__(self):
         return len(self.entries)
@@ -233,20 +236,14 @@ class SceneDataset(Dataset):
 
         return self.entries[idx]
 
-    def get_tokenizer(self):
-        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, cache_dir=self.cache_dir)
-        tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_TOKENS)})
-
-        return tokenizer
-
     def process(self, filenames: List[str]):
         pool = Pool(10)
         start_time = time.time()
         results = []
         dataprocessor = DataProcessor(
             args=self.args,
-            tokenizer=self.get_tokenizer(),
-            max_sequence_length=self.args.max_sequence_length,
+            tokenizer=self.tokenizer,
+            max_seq_length=self.args.max_seq_length,
         )
 
         for filename in filenames:
@@ -286,20 +283,111 @@ class SceneDataset(Dataset):
 
         return entries
 
+    def tensorize(self):
+        if self.split == "train":
+            num_examples = 50000
+        elif self.split == "validation":
+            num_examples = 5000
+        else:
+            num_examples = 2000
+        results = []
+
+        pool = Pool(10)
+
+        start_time = time.time()
+        for entry in self.entries[:num_examples]:
+            results.append(pool.apply_async(type(self)._tensorize, [entry, self.tokenizer]))
+        pool.close()
+
+        self.tensor_features = []
+        for result in tqdm(results, unit="file", dynamic_ncols=True, desc=f"Processing {self.split} Tensorization"):
+            tensor_feat = result.get()
+            self.tensor_features.append(tensor_feat)
+
+        pool.join()
+        end_time = time.time()
+        print("  >> Tensorization Processing Time: {}".format(end_time - start_time))
+        print("")
+
+    @staticmethod
+    def _tensorize(entry, tokenizer):
+        choices_features = list()
+        mcq_inputs, label = entry["mcq_input"], entry["answer"]
+        for choice in mcq_inputs:
+            inputs = tokenizer.encode_plus(choice, add_special_tokens=True, max_length=args.max_seq_length)
+            input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
+            attention_mask = [1] * len(input_ids)
+            padding_length = args.max_seq_length - len(input_ids)
+            if padding_length:
+                input_ids = input_ids + ([tokenizer.pad_token_id] * padding_length)
+                attention_mask = attention_mask + ([0] * padding_length)
+                token_type_ids = token_type_ids + ([tokenizer.pad_token_id] * padding_length)
+            choices_features.append((input_ids, attention_mask, token_type_ids))
+
+        return InputFeatures(example_id=entry["cur_seq_id"], choices_features=choices_features, label=label)
+
+
+def select_field(features, field):
+    return [[choice[field] for choice in feature.choices_features] for feature in features]
+
 
 def perform_preprocessing(args):
     """
     Preprocess the dataset according to the passed in args
     """
-    res = dict()
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, cache_dir=args.cache_dir)
+    tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_TOKENS)})
+
     for split in SPLIT_NAMES:  # train. valid. test
-        with open(osp.join(get_project_root(), args.data_dir, f"{split}_filenames.txt"), "rt") as file:
-            filenames = [osp.join(get_project_root(), args.data_dir, filename).strip() for filename in file.readlines()]
+        root = get_project_root()
+        with open(osp.join(root, args.data_dir, f"{split}_filenames.txt"), "rt") as file:
+            filenames = [osp.join(root, args.data_dir, filename).strip() for filename in file.readlines()]
 
-        dataset = SceneDataset(args, split, args.tokenizer_name, cache_dir=args.cache_dir)
+        cached_file_name = f"cached_{split}_{args.tokenizer_name}_{str(args.max_seq_length)}"
+        cached_features_file = os.path.join(args.data_dir, cached_file_name)
+
+        if os.path.exists(cached_features_file):
+            print(f"Loading features from cached file {cached_features_file}")
+            features = torch.load(cached_features_file)
+        else:
+            dataset = SceneDataset(args, split, tokenizer, cache_dir=args.cache_dir)
+            dataset.process(filenames)
+            dataset.tensorize()
+            features = dataset.tensor_features
+            print(f"Saving features into cached file {cached_features_file}")
+            torch.save(features, cached_features_file)
+
+
+def get_dataset(args, split, tokenizer):
+    """
+    Get train/valid/test dataset
+    """
+    root = get_project_root()
+    with open(osp.join(root, args.data_dir, f"{split}_filenames.txt"), "rt") as file:
+        filenames = [osp.join(root, args.data_dir, filename).strip() for filename in file.readlines()]
+
+    cached_file_name = f"cached_{split}_{args.tokenizer_name}_{str(args.max_seq_length)}"
+    cached_features_file = os.path.join(args.data_dir, cached_file_name)
+
+    if os.path.exists(cached_features_file):
+        print(f"Loading features from cached file {cached_features_file}")
+        features = torch.load(cached_features_file)
+    else:
+        dataset = SceneDataset(args, split, tokenizer, cache_dir=args.cache_dir)
         dataset.process(filenames)
+        dataset.tensorize()
+        features = dataset.tensor_features
+        print(f"Saving features into cached file {cached_features_file}")
+        torch.save(features, cached_features_file)
 
-        res[split] = dataset.entries
+    # Convert to Tensors and build dataset
+    all_input_ids = torch.tensor(select_field(features, "input_ids"), dtype=torch.long)
+    all_input_mask = torch.tensor(select_field(features, "input_mask"), dtype=torch.long)
+    all_segment_ids = torch.tensor(select_field(features, "segment_ids"), dtype=torch.long)
+    all_label_ids = torch.tensor([f.label for f in features], dtype=torch.long)
+
+    dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+    return dataset
 
 
 if __name__ == "__main__":
