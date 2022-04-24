@@ -5,3 +5,7 @@ flake8==3.9.2
 
 # for safe code :)
 pytest==6.2.4
+
+jedi
+mypy
+pylint

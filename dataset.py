@@ -1,15 +1,23 @@
-#-*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # Implemented by Yoonseok Heo at 200423
 
-from torch.utils.data import Dataset
-from transformers import AutoTokenizer, PreTrainedTokenizer
 from typing import Any, Dict, List, Optional, Sequence
-from path.path import get_project_root
-from tqdm import tqdm
-from multiprocessing import Pool
+
+import argparse
+import copy
+import json
+import os
 import os.path as osp
+import random
+import time
+from multiprocessing import Pool
+
 import numpy as np
-import os, argparse, random, json, time, logging, copy
+from torch.utils.data import Dataset
+from tqdm import tqdm
+from transformers import AutoTokenizer, PreTrainedTokenizer
+
+from path.path import get_project_root
 
 SPLIT_NAMES = ("train", "validation", "test")
 CLS_TOKEN = "<CLS>"
@@ -23,17 +31,14 @@ SPECIAL_TOKENS = [
 NARRATOR_ID = "-1"
 NARRATOR_NAME = "Narrator"
 NARRATOR_DESC = ""
-NARRATOR_DICT = {
-    "char_id": NARRATOR_ID,
-    "char_name": NARRATOR_NAME,
-    "char_desc": NARRATOR_DESC
-}
+NARRATOR_DICT = {"char_id": NARRATOR_ID, "char_name": NARRATOR_NAME, "char_desc": NARRATOR_DESC}
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--data_dir', type=str, default="data/storium/")
-    parser.add_argument("--cache_dir", type=str, default="cache")
+    parser.add_argument("--data_dir", type=str, default="data/storium/")
+    parser.add_argument("--cache_dir", type=str, default="caches")
     parser.add_argument("--max_sequence_length", type=int, default=1000)
     parser.add_argument("--max_prev_story_length", type=int, default=450)
     parser.add_argument("--max_establishment_length", type=int, default=200)
@@ -41,7 +46,7 @@ def parse_args():
     parser.add_argument("--trim", type=str, default="end")
     parser.add_argument("--valid_ratio", type=float, default=0.2)
     parser.add_argument("--num_test", type=int, default=10000)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tokenizer_name", type=str, default="bert-base-uncased")
 
     # Parse the arguments.
@@ -51,17 +56,14 @@ def parse_args():
 
     return args
 
+
 class DataProcessor:
     """
-        This class encapsulates the functionality needed to preprocess the Storium
-        data in a format that we can use.
+    This class encapsulates the functionality needed to preprocess the Storium
+    data in a format that we can use.
     """
-    def __init__(
-            self, args,
-            tokenizer: PreTrainedTokenizer,
-            max_sequence_length: int = 800
 
-    ):
+    def __init__(self, args, tokenizer: PreTrainedTokenizer, max_sequence_length: int = 800):
         self.args = args
         self.tokenizer = tokenizer
         self.max_sequence_length = max_sequence_length
@@ -70,7 +72,7 @@ class DataProcessor:
 
         toks = filepath.strip().split("/")
         filename = toks[-1]
-        filename = "LS_"+filename
+        filename = "LS_" + filename
         toks[-1] = filename
         new_path = "/".join(toks)
         with open(new_path, "rt") as f:
@@ -93,24 +95,18 @@ class DataProcessor:
                 previously_generated_story = entry["desc"]
                 if previously_generated_story is None:
                     continue
-                try:
-                    char_id = entry["label"]["char_id"]
-                except:
-                    char_id = NARRATOR_ID
-                try:
-                    char_name = entry["label"]["char_name"]
-                except:
-                    char_name = NARRATOR_NAME
-                try:
-                    char_desc = entry["label"]["char_desc"]
-                except:
-                    char_desc = NARRATOR_DESC
+                char_id = entry["label"]["char_id"] if "char_id" in entry["label"].keys() else NARRATOR_ID
+                char_name = entry["label"]["char_name"] if "char_name" in entry["label"].keys() else NARRATOR_NAME
+                char_desc = entry["label"]["char_desc"] if "char_desc" in entry["label"].keys() else NARRATOR_DESC
                 estab_desc = entry["label"]["establishment_desc"]
 
                 candidates, answer_idx = self.get_candidates(
-                    character_pool=character_pool, character_id_list= char_id_list, cur_char_id=char_id)
+                    character_pool=character_pool, character_id_list=char_id_list, cur_char_id=char_id
+                )
 
-                mcq_input_list = self.process_mcq_input_representation(previously_generated_story, char_name, char_desc, estab_desc, candidates)
+                mcq_input_list = self.process_mcq_input_representation(
+                    previously_generated_story, char_name, char_desc, estab_desc, candidates
+                )
                 entry_dict["mcq_input"] = mcq_input_list
                 entry_dict["answer"] = answer_idx
                 entry_dict["cur_seq_id"] = entry["cur_seq_id"]
@@ -120,12 +116,12 @@ class DataProcessor:
         return story_mcq_input_list
 
     def process_mcq_input_representation(
-            self,
-            previously_generated_story: str,
-            char_name: str,
-            char_description: str,
-            estab_description: str,
-            candidates: List
+        self,
+        previously_generated_story: str,
+        char_name: str,
+        char_description: str,
+        estab_description: str,
+        candidates: List,
     ):
         prev_story = previously_generated_story.replace("\n\n", " ").replace("----", " ").strip()
         establishment_description = estab_description.replace("\n\n", " ").replace("----", " ").strip()
@@ -133,23 +129,20 @@ class DataProcessor:
         # Trim previosuly generated story and establishment description
         num_words = len(prev_story.strip().split(" "))
         if num_words > self.args.max_prev_story_length:
-            prev_story = self.trim_sentence(
-                prev_story, max_size=self.args.max_prev_story_length,
-                flag=self.args.trim)
+            prev_story = self.trim_sentence(prev_story, max_size=self.args.max_prev_story_length, flag=self.args.trim)
 
         num_words = len(establishment_description.strip().split(" "))
         if num_words > self.args.max_establishment_length:
             establishment_description = self.trim_sentence(
-                establishment_description,
-                max_size=self.args.max_establishment_length, flag=self.args.trim)
+                establishment_description, max_size=self.args.max_establishment_length, flag=self.args.trim
+            )
 
         mcq_input_list = []
         for idx, choice in enumerate(candidates):
-            #mcq_input = CLS_TOKEN
             mcq_input = prev_story
-            mcq_input += SPECIAL_TOKENS[0]      # SPECIAL_TOKEN: <|CHAR_NAME|>
+            mcq_input += SPECIAL_TOKENS[0]  # SPECIAL_TOKEN: <|CHAR_NAME|>
             mcq_input += choice["char_name"]
-            mcq_input += SPECIAL_TOKENS[1]      # SPECIAL_TOKEN: <|CHAR_DESCRIPTION|>
+            mcq_input += SPECIAL_TOKENS[1]  # SPECIAL_TOKEN: <|CHAR_DESCRIPTION|>
 
             # Truncate char_description
             char_desc = choice["char_desc"].replace("\n\n", " ").replace("----", " ").strip()
@@ -157,10 +150,10 @@ class DataProcessor:
             num_words = len(char_desc.split(" "))
             if num_words >= self.args.max_char_description_length:
                 char_desc = self.trim_sentence(
-                    char_desc, max_size=self.args.max_char_description_length,
-                    flag=self.args.trim)
+                    char_desc, max_size=self.args.max_char_description_length, flag=self.args.trim
+                )
             mcq_input += char_desc
-            mcq_input += SPECIAL_TOKENS[2]      # SPECIAL_TOKEN: <|ESTABLISHMENT|>
+            mcq_input += SPECIAL_TOKENS[2]  # SPECIAL_TOKEN: <|ESTABLISHMENT|>
             mcq_input += establishment_description
 
             mcq_input_list.append(mcq_input)
@@ -187,11 +180,10 @@ class DataProcessor:
         candidates_ids_list.append(cur_char_id)
         random.shuffle(candidates_ids_list)
 
-        candidates =[character_pool[char_id]for char_id in candidates_ids_list]
+        candidates = [character_pool[char_id] for char_id in candidates_ids_list]
         answer_idx = candidates_ids_list.index(cur_char_id)
 
         return candidates, answer_idx
-
 
     def get_character_pool(self, character_list):
         char_id_list = []
@@ -208,12 +200,9 @@ class DataProcessor:
 
         return char_id_dict, char_id_list
 
-
-
     def trim_sentence(self, info_str: str, max_size: int, flag: str) -> str:
         info_list = info_str.strip().split(" ")
         num_words = len(info_list)
-        #slice_size = max_size - num_words
         slice_size = num_words - max_size
         if flag.lower() == "start":
             new_list = info_list[slice_size:]
@@ -227,11 +216,8 @@ class DataProcessor:
         return " ".join(new_list)
 
 
-
 class SceneDataset(Dataset):
-    def __init__(
-        self, args, split: str, tokenizer_name: str, cache_dir: Optional[str] = None
-    ):
+    def __init__(self, args, split: str, tokenizer_name: str, cache_dir: Optional[str] = None):
         self.args = args
         self.split = split.lower()
         self.cache_dir = cache_dir
@@ -253,37 +239,29 @@ class SceneDataset(Dataset):
 
         return tokenizer
 
-    def process(
-            self,
-            filenames: List[str]
-    ):
+    def process(self, filenames: List[str]):
         pool = Pool(10)
         start_time = time.time()
         results = []
-        #pool = Pool()
         dataprocessor = DataProcessor(
             args=self.args,
-            tokenizer= self.get_tokenizer(),
-            max_sequence_length = self.args.max_sequence_length,
+            tokenizer=self.get_tokenizer(),
+            max_sequence_length=self.args.max_sequence_length,
         )
 
         for filename in filenames:
-            results.append(
-                pool.apply_async(type(self)._process, [filename, dataprocessor])
-                #self._process(filename, dataprocessor)
-            )
+            results.append(pool.apply_async(type(self)._process, [filename, dataprocessor]))
 
         pool.close()
 
         self.entries = []
         for result in tqdm(
-                results,
-                unit="file",
-                dynamic_ncols=True,
-                desc=f"Processing {self.split} set",
+            results,
+            unit="file",
+            dynamic_ncols=True,
+            desc=f"Processing {self.split} set",
         ):
             entries = result.get()
-            #entries = result       # Single Processor Debug
             if entries == -1:
                 continue
 
@@ -296,16 +274,14 @@ class SceneDataset(Dataset):
         pool.join()
 
         end_time = time.time()
-        print("  >> Data Preprocessing Time: {}".format(end_time-start_time))
+        print("  >> Data Preprocessing Time: {}".format(end_time - start_time))
         print("")
-
 
     @staticmethod
     def _process(filename: str, dataprocessor: DataProcessor):
         """
         Process a single file and return the resulting entries
         """
-
         entries = dataprocessor.process_story_file(filename)
 
         return entries
@@ -316,21 +292,15 @@ def perform_preprocessing(args):
     Preprocess the dataset according to the passed in args
     """
     res = dict()
-    for split in SPLIT_NAMES:       # train. valid. test
-        with open(os.path.join(get_project_root(), args.data_dir, f"{split}_filenames.txt"), "rt") as file:
-            filenames = [
-                os.path.join(get_project_root(), args.data_dir, filename).strip()
-                for filename in file.readlines()
-            ]
+    for split in SPLIT_NAMES:  # train. valid. test
+        with open(osp.join(get_project_root(), args.data_dir, f"{split}_filenames.txt"), "rt") as file:
+            filenames = [osp.join(get_project_root(), args.data_dir, filename).strip() for filename in file.readlines()]
 
         dataset = SceneDataset(args, split, args.tokenizer_name, cache_dir=args.cache_dir)
-        #filenames = ["/media/ksw1/hdd2/yoon/CMU/MULTI/group/guideline_generation/data/storium/full_export/0/0/00365t.json"]
         dataset.process(filenames)
 
-        #logging.info("%s %s", split, dataset.stats_str())
-
         res[split] = dataset.entries
-        print("PAUSE")
+
 
 if __name__ == "__main__":
     args = parse_args()
