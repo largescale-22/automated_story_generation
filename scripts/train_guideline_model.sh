@@ -1,4 +1,4 @@
-python new_guideline.py \
+python guideline.py \
   --model_name_or_path bert-base-uncased \
   --max_seq_length 512 \
   --per_device_train_batch_size 8 \

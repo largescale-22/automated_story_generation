@@ -1,7 +1,6 @@
-comet-ml>=2.0.18
-numpy>=1.17.3
+numpy
 torch>=1.1.0
-transformers==2.2.0
-git+https://github.com/NVIDIA/apex.git@82dac9c#egg=apex --global-option="--cuda_ext" --global-option="--cpp_ext"
-kiwisolver==1.1.0
-dataclasses;python_version<'3.7'
+transformers==4.9.0
+tqdm
+datasets
+accelerate
