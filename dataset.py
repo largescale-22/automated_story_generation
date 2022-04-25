@@ -11,6 +11,7 @@ import os.path as osp
 import random
 import time
 from multiprocessing import Pool
+from xmlrpc.client import Boolean
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ NARRATOR_ID = "-1"
 NARRATOR_NAME = "Narrator"
 NARRATOR_DESC = ""
 NARRATOR_DICT = {"char_id": NARRATOR_ID, "char_name": NARRATOR_NAME, "char_desc": NARRATOR_DESC}
+NUM_EXAMPLES = {"train": 50000, "validation": 5000, "test": 2000}
 
 
 def parse_args():
@@ -41,15 +43,12 @@ def parse_args():
 
     parser.add_argument("--data_dir", type=str, default="data/storium/")
     parser.add_argument("--cache_dir", type=str, default="caches")
-    parser.add_argument("--max_seq_length", type=int, default=1000)
-    parser.add_argument("--max_prev_story_length", type=int, default=450)
+    parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument("--max_prev_story_length", type=int, default=200)
     parser.add_argument("--max_establishment_length", type=int, default=200)
-    parser.add_argument("--max_char_description_length", type=int, default=320)
+    parser.add_argument("--max_char_description_length", type=int, default=300)
     parser.add_argument("--trim", type=str, default="end")
-    parser.add_argument("--valid_ratio", type=float, default=0.2)
-    parser.add_argument("--num_test", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--tokenizer_name", type=str, default="bert-base-uncased")
 
     # Parse the arguments.
     args = parser.parse_args()
@@ -155,8 +154,8 @@ class DataProcessor:
                     char_desc, max_size=self.args.max_char_description_length, flag=self.args.trim
                 )
             mcq_input += char_desc
-            mcq_input += SPECIAL_TOKENS[2]  # SPECIAL_TOKEN: <|ESTABLISHMENT|>
-            mcq_input += establishment_description
+            # mcq_input += SPECIAL_TOKENS[2]  # SPECIAL_TOKEN: <|ESTABLISHMENT|>
+            # mcq_input += establishment_description
 
             mcq_input_list.append(mcq_input)
 
@@ -283,20 +282,15 @@ class SceneDataset(Dataset):
 
         return entries
 
-    def tensorize(self):
-        if self.split == "train":
-            num_examples = 50000
-        elif self.split == "validation":
-            num_examples = 5000
-        else:
-            num_examples = 2000
+    def tensorize(self, split):
+        num_examples = NUM_EXAMPLES[split]
         results = []
 
         pool = Pool(10)
 
         start_time = time.time()
         for entry in self.entries[:num_examples]:
-            results.append(pool.apply_async(type(self)._tensorize, [entry, self.tokenizer]))
+            results.append(pool.apply_async(type(self)._tensorize, [entry, self.tokenizer, self.args.max_seq_length]))
         pool.close()
 
         self.tensor_features = []
@@ -310,19 +304,18 @@ class SceneDataset(Dataset):
         print("")
 
     @staticmethod
-    def _tensorize(entry, tokenizer):
+    def _tensorize(entry, tokenizer, max_seq_length):
         choices_features = list()
         mcq_inputs, label = entry["mcq_input"], entry["answer"]
         for choice in mcq_inputs:
-            inputs = tokenizer.encode_plus(choice, add_special_tokens=True, max_length=args.max_seq_length)
-            input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
-            attention_mask = [1] * len(input_ids)
-            padding_length = args.max_seq_length - len(input_ids)
-            if padding_length:
-                input_ids = input_ids + ([tokenizer.pad_token_id] * padding_length)
-                attention_mask = attention_mask + ([0] * padding_length)
-                token_type_ids = token_type_ids + ([tokenizer.pad_token_id] * padding_length)
-            choices_features.append((input_ids, attention_mask, token_type_ids))
+            tokenized_example = tokenizer(choice, max_length=max_seq_length, padding="max_length", truncation=True)
+            choices_features.append(
+                (
+                    tokenized_example["input_ids"],
+                    tokenized_example["attention_mask"],
+                    tokenized_example["token_type_ids"],
+                )
+            )
 
         return InputFeatures(example_id=entry["cur_seq_id"], choices_features=choices_features, label=label)
 
@@ -335,7 +328,7 @@ def perform_preprocessing(args):
     """
     Preprocess the dataset according to the passed in args
     """
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, cache_dir=args.cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, cache_dir=args.cache_dir)
     tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_TOKENS)})
 
     for split in SPLIT_NAMES:  # train. valid. test
@@ -343,7 +336,7 @@ def perform_preprocessing(args):
         with open(osp.join(root, args.data_dir, f"{split}_filenames.txt"), "rt") as file:
             filenames = [osp.join(root, args.data_dir, filename).strip() for filename in file.readlines()]
 
-        cached_file_name = f"cached_{split}_{args.tokenizer_name}_{str(args.max_seq_length)}"
+        cached_file_name = f"cached_{split}_{args.model_name_or_path}_{str(args.max_seq_length)}"
         cached_features_file = os.path.join(args.data_dir, cached_file_name)
 
         if os.path.exists(cached_features_file):
@@ -352,7 +345,7 @@ def perform_preprocessing(args):
         else:
             dataset = SceneDataset(args, split, tokenizer, cache_dir=args.cache_dir)
             dataset.process(filenames)
-            dataset.tensorize()
+            dataset.tensorize(split)
             features = dataset.tensor_features
             print(f"Saving features into cached file {cached_features_file}")
             torch.save(features, cached_features_file)
@@ -366,7 +359,7 @@ def get_dataset(args, split, tokenizer):
     with open(osp.join(root, args.data_dir, f"{split}_filenames.txt"), "rt") as file:
         filenames = [osp.join(root, args.data_dir, filename).strip() for filename in file.readlines()]
 
-    cached_file_name = f"cached_{split}_{args.tokenizer_name}_{str(args.max_seq_length)}"
+    cached_file_name = f"cached_{split}_{args.model_name_or_path}_{str(args.max_seq_length)}"
     cached_features_file = os.path.join(args.data_dir, cached_file_name)
 
     if os.path.exists(cached_features_file):
@@ -375,7 +368,7 @@ def get_dataset(args, split, tokenizer):
     else:
         dataset = SceneDataset(args, split, tokenizer, cache_dir=args.cache_dir)
         dataset.process(filenames)
-        dataset.tensorize()
+        dataset.tensorize(split)
         features = dataset.tensor_features
         print(f"Saving features into cached file {cached_features_file}")
         torch.save(features, cached_features_file)
