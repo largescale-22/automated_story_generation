@@ -4,3 +4,4 @@ transformers==4.9.0
 tqdm
 datasets
 accelerate
+scikit-learn

@@ -11,6 +11,7 @@ import torch
 import transformers
 from accelerate import Accelerator
 from datasets import load_metric
+from sklearn.metrics import top_k_accuracy_score
 from torch.utils.data.dataloader import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
@@ -60,6 +61,7 @@ def parse_args():
         default=8,
         help="Batch size (per device) for the evaluation dataloader.",
     )
+    parser.add_argument("--do_eval", type=str, default=None, help="model path if you want to do only evaluation.")
     parser.add_argument(
         "--learning_rate",
         type=float,
@@ -141,20 +143,25 @@ def main():
         set_seed(args.seed)
 
     # download model & vocab.
-    config = AutoConfig.from_pretrained(args.model_name_or_path)
+    model_path = args.model_name_or_path if args.do_eval is None else args.do_eval
+    config = AutoConfig.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_TOKENS)})
-    model = AutoModelForMultipleChoice.from_pretrained(args.model_name_or_path, config=config)
+    model = AutoModelForMultipleChoice.from_pretrained(model_path, config=config)
     model.resize_token_embeddings(len(tokenizer))
     model = torch.nn.DataParallel(model)
 
     # get dataset
-    train_dataset = get_dataset(args, "train", tokenizer)
     eval_dataset = get_dataset(args, "validation", tokenizer)
+    if args.do_eval is None:
+        train_dataset = get_dataset(args, "train", tokenizer)
+    else:
+        train_dataset = eval_dataset
 
     # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    if args.do_eval is None:
+        for index in random.sample(range(len(train_dataset)), 3):
+            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=args.per_device_train_batch_size)
     eval_dataloader = DataLoader(eval_dataset, batch_size=args.per_device_eval_batch_size)
@@ -198,7 +205,7 @@ def main():
     )
 
     # Metrics
-    metric = load_metric("accuracy")
+    metric_acc = load_metric("accuracy")
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -215,6 +222,34 @@ def main():
     completed_steps = 0
 
     for epoch in range(args.num_train_epochs):
+        if args.do_eval is not None:
+            model.eval()
+            eval_topk_acc = 0
+            for step, batch in enumerate(eval_dataloader):
+                with torch.no_grad():
+                    batch = tuple(t.to(device) for t in batch)
+                    inputs = {
+                        "input_ids": batch[0],
+                        "attention_mask": batch[1],
+                        "token_type_ids": batch[2],
+                        "labels": batch[3],
+                    }
+
+                    outputs = model(**inputs)
+                predictions = outputs.logits.argmax(dim=-1)
+                metric_acc.add_batch(
+                    predictions=accelerator.gather(predictions),
+                    references=accelerator.gather(inputs["labels"]),
+                )
+                eval_topk_acc += top_k_accuracy_score(
+                    inputs["labels"].cpu(), outputs.logits.cpu(), k=2, labels=[0, 1, 2, 3, 4]
+                )
+
+            eval_acc = metric_acc.compute()
+            eval_topk_acc /= len(eval_dataloader)
+            accelerator.print(f"epoch {epoch}: ACC[{eval_acc}], Top2 ACC:[{eval_topk_acc}]")
+            break
+
         model.train()
         for step, batch in enumerate(train_dataloader):
             batch = tuple(t.to(device) for t in batch)
@@ -228,7 +263,6 @@ def main():
             outputs = model(**inputs)
             loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
-            # accelerator.backward(loss)
             loss.sum().backward()
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
@@ -241,6 +275,7 @@ def main():
                 break
 
         model.eval()
+        eval_topk_acc = 0
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 batch = tuple(t.to(device) for t in batch)
@@ -253,13 +288,17 @@ def main():
 
                 outputs = model(**inputs)
             predictions = outputs.logits.argmax(dim=-1)
-            metric.add_batch(
+            metric_acc.add_batch(
                 predictions=accelerator.gather(predictions),
                 references=accelerator.gather(inputs["labels"]),
             )
+            eval_topk_acc += top_k_accuracy_score(
+                inputs["labels"].cpu(), outputs.logits.cpu(), k=2, labels=[0, 1, 2, 3, 4]
+            )
 
-        eval_metric = metric.compute()
-        accelerator.print(f"epoch {epoch}: {eval_metric}")
+        eval_acc = metric_acc.compute()
+        eval_topk_acc /= len(eval_dataloader)
+        accelerator.print(f"epoch {epoch}: ACC[{eval_acc}], Top2 ACC:[{eval_topk_acc}]")
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
