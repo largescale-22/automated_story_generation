@@ -4,4 +4,4 @@ python guideline.py \
   --per_device_train_batch_size 8 \
   --learning_rate 2e-5 \
   --num_train_epochs 10 \
-  --output_dir tmp/swag/
+  --output_dir models/bert-base-uncased
